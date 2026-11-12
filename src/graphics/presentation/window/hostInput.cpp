@@ -156,6 +156,7 @@ uint64_t           g_cursor_hide_at = 0;
 struct GamepadTouchPadState {
 	bool     enabled   = false;
 	bool     drawing   = false;
+	bool     wait_for_stick_neutral = false;
 	int      id        = -1;
 	int      x_axis    = 128;
 	int      y_axis    = 128;
@@ -676,10 +677,19 @@ int PollGamepadTouchPad(uint64_t now_ms) {
 		};
 		const float old_x = g_gamepad_touchpad.x;
 		const float old_y = g_gamepad_touchpad.y;
-		g_gamepad_touchpad.x = std::clamp(
-		    old_x + velocity(g_gamepad_touchpad.x_axis) * GAMEPAD_TOUCHPAD_SPEED * dt, 0.0f, 1.0f);
-		g_gamepad_touchpad.y = std::clamp(
-		    old_y + velocity(g_gamepad_touchpad.y_axis) * GAMEPAD_TOUCHPAD_SPEED * dt, 0.0f, 1.0f);
+		// After a draw-release reset, suppress the still-held stick until it returns to neutral.
+		// Otherwise the cursor instantly leaves the center again at the next 8 ms poll.
+		if (g_gamepad_touchpad.wait_for_stick_neutral) {
+			if (velocity(g_gamepad_touchpad.x_axis) == 0.0f &&
+			    velocity(g_gamepad_touchpad.y_axis) == 0.0f) {
+				g_gamepad_touchpad.wait_for_stick_neutral = false;
+			}
+		} else {
+			g_gamepad_touchpad.x = std::clamp(
+			    old_x + velocity(g_gamepad_touchpad.x_axis) * GAMEPAD_TOUCHPAD_SPEED * dt, 0.0f, 1.0f);
+			g_gamepad_touchpad.y = std::clamp(
+			    old_y + velocity(g_gamepad_touchpad.y_axis) * GAMEPAD_TOUCHPAD_SPEED * dt, 0.0f, 1.0f);
+		}
 		if (old_x != g_gamepad_touchpad.x || old_y != g_gamepad_touchpad.y) {
 			g_mouse_touchpad.revision++;
 		}
@@ -926,7 +936,17 @@ bool HostInputGamepadDrawButton(int id, bool down) {
 		y                          = g_gamepad_touchpad.y;
 		g_mouse_touchpad.revision++;
 	}
+	// End the old stroke at its real final coordinate before resetting the displayed cursor.
 	Controller::SetTouchPad(id, 1, down, x, y);
+	if (!down) {
+		std::scoped_lock lock(g_touchpad_mutex);
+		if (g_gamepad_touchpad.enabled && g_gamepad_touchpad.id == id) {
+			g_gamepad_touchpad.x = 0.5f;
+			g_gamepad_touchpad.y = 0.5f;
+			g_gamepad_touchpad.wait_for_stick_neutral = true;
+			g_mouse_touchpad.revision++;
+		}
+	}
 	return true;
 }
 
