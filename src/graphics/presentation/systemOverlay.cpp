@@ -31,6 +31,7 @@
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -154,6 +155,14 @@ bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 constexpr size_t INPUT_QUEUE_CAPACITY = 128;
 constexpr int    MAX_TOUCH_CURSOR_IMAGE_DIMENSION = 2048;
 constexpr float  TOUCH_CURSOR_IMAGE_SIZE          = 48.0f;
+
+// V5: light-weight CPU-projected 3D mesh preview. This is host-side only;
+// it does not inject or animate bones in the PS5 guest.
+struct PreviewTriangle {
+    float position[9];
+    uint8_t rgba[4];
+};
+static_assert(sizeof(PreviewTriangle) == 40);
 
 enum class TouchParticleSkin : uint8_t { Classic, BlueNeon, Monochrome, Crimson, RedBlue };
 
@@ -709,8 +718,8 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
-	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            cursor.enabled,
+	// The stamp is an always-visible host-side overlay, even when touch mode is off.
+	return {true,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
 	            PerformanceOverlayRevision()};
@@ -884,6 +893,9 @@ struct SystemOverlay::Impl {
 			if (drawing_cursor_image) {
 				ImGui::UnregisterUserTexture(drawing_cursor_image.get());
 			}
+			if (moving_stamp_image) {
+				ImGui::UnregisterUserTexture(moving_stamp_image.get());
+			}
 			if (trophy_notification_image) {
 				ImGui::UnregisterUserTexture(trophy_notification_image.get());
 			}
@@ -917,6 +929,7 @@ struct SystemOverlay::Impl {
 		style.ItemSpacing    = {8.0f, 8.0f};
 		hand_cursor_image    = LoadTouchCursorImage("hand.png");
 		drawing_cursor_image = LoadTouchCursorImage("drawing.png");
+		// V5 preview replaces the moving PNG stamp.
 	}
 
 	void PlayTrophySound() {
@@ -1583,6 +1596,74 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	// Non-interactive image rendered on top of the guest's video output.
+	// Does not alter touch input, guest RAM, game objects, or Vulkan shader cache.
+	void LoadCenterModelPreview() {
+		if (center_model_loaded) return;
+		center_model_loaded = true;
+		const char* base = SDL_GetBasePath();
+		if (!base) return;
+		const std::string path = std::string(base) + "assets/models/chara_115201_triangles.bin";
+		std::ifstream input(path, std::ios::binary);
+		if (!input) { LOGF("[V5] missing model preview: %s\n", path.c_str()); return; }
+		char magic[4] = {};
+		uint32_t size = 0;
+		input.read(magic, 4);
+		input.read(reinterpret_cast<char*>(&size), sizeof(size));
+		if (std::memcmp(magic, "K3DV", 4) != 0 || size > 300000) return;
+		center_model_mesh.resize(size);
+		input.read(reinterpret_cast<char*>(center_model_mesh.data()),
+		           static_cast<std::streamsize>(size * sizeof(PreviewTriangle)));
+		if (!input) center_model_mesh.clear();
+		LOGF("[V5] loaded %zu mesh preview triangles\n", center_model_mesh.size());
+	}
+
+	void DrawCenterModelPreview(vk::Extent2D frame_extent, Clock::time_point now) {
+		LoadCenterModelPreview();
+		if (center_model_mesh.empty() || !frame_extent.width || !frame_extent.height) return;
+		// Bounded overlay footprint: about 30% of the frame height.
+		const float width = static_cast<float>(frame_extent.width);
+		const float height = static_cast<float>(frame_extent.height);
+		const float scale = std::min(height * 0.26f, width * 0.27f);
+		const float cx = width * 0.5f;
+		const float cy = height * 0.5f;
+		if (center_model_start == Clock::time_point {}) center_model_start = now;
+		const float t = std::chrono::duration<float>(now-center_model_start).count();
+		const float angle = 0.22f * std::sin(t * 0.42f); // gentle 3D turn
+		const float sn = std::sin(angle), cs = std::cos(angle);
+		struct DrawTri { ImVec2 p[3]; ImU32 color; float z; };
+		std::vector<DrawTri> draw_queue;
+		draw_queue.reserve(center_model_mesh.size());
+		for (const auto& tri : center_model_mesh) {
+			DrawTri out{};
+			float x[3], y[3], z[3];
+			for (int k=0; k<3; ++k) {
+				const float ox=tri.position[k*3], oy=tri.position[k*3+1], oz=tri.position[k*3+2];
+				x[k] = cs*ox + sn*oz;
+				y[k] = oy - 0.52f;
+				z[k] = cs*oz - sn*ox;
+				out.p[k] = {cx + x[k]*scale, cy - y[k]*scale};
+			}
+			const float ax=x[1]-x[0], ay=y[1]-y[0], az=z[1]-z[0];
+			const float bx=x[2]-x[0], by=y[2]-y[0], bz=z[2]-z[0];
+			const float nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
+			const float len=std::sqrt(nx*nx+ny*ny+nz*nz);
+			if (len < 0.000001f) continue;
+			const float lit=0.48f + 0.5f*std::abs((nx*0.35f + ny*0.66f + nz*0.66f)/len);
+			out.color=IM_COL32(static_cast<int>(tri.rgba[0]*lit),
+			                    static_cast<int>(tri.rgba[1]*lit),
+			                    static_cast<int>(tri.rgba[2]*lit),255);
+			out.z=(z[0]+z[1]+z[2])/3.0f;
+			draw_queue.push_back(out);
+		}
+		// Approximate painter's ordering for ImGui overlay triangles.
+		std::sort(draw_queue.begin(),draw_queue.end(),
+		          [](const DrawTri& a,const DrawTri& b){return a.z < b.z;});
+		auto* draw=ImGui::GetForegroundDrawList();
+		for (const auto& tri:draw_queue)
+			draw->AddTriangleFilled(tri.p[0],tri.p[1],tri.p[2],tri.color);
+	}
+
 	void DrawTouchPadCursor(const HostInputTouchPadVisualState& state) {
 		if (!TouchCursorImageEnabled()) {
 			particles.clear();
@@ -1800,11 +1881,7 @@ struct SystemOverlay::Impl {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
-		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
-			return false;
-		}
+		// Always prepare the overlay so the moving stamp animates during gameplay.
 		const auto prepared_session = snapshot.session;
 		EnsureVulkan(format, image_count);
 		if (session != snapshot.session) {
@@ -1843,6 +1920,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now, performance_bottom);
+		DrawCenterModelPreview(frame_extent, now);
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;
@@ -1900,6 +1978,11 @@ struct SystemOverlay::Impl {
 	std::unique_ptr<ImTextureData>              trophy_notification_image;
 	std::unique_ptr<ImTextureData>              hand_cursor_image;
 	std::unique_ptr<ImTextureData>              drawing_cursor_image;
+	std::unique_ptr<ImTextureData>              moving_stamp_image;
+	bool center_model_loaded = false;
+	std::vector<PreviewTriangle> center_model_mesh;
+	Clock::time_point center_model_start;
+	Clock::time_point                           stamp_start;
 	bool                                        cursor_initialized = false;
 	ImVec2                                      cursor_position {};
 	float                                       particle_distance  = 0.0f;
